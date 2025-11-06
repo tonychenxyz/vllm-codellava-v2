@@ -23,12 +23,14 @@
 # limitations under the License.
 """Inference-only Qwen3 model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
-from typing import Any
+import base64
+import io
+from collections.abc import Iterable, Mapping
+from typing import Any, Optional, Sequence, Union
 
 import torch
 from torch import nn
-from transformers import Qwen3Config
+from transformers import BatchFeature, Qwen3Config
 
 from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
@@ -41,15 +43,247 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import (ModalityData, MultiModalDataDict,
+                                    MultiModalFieldConfig)
+from vllm.multimodal.parse import (EmbeddingItems, MultiModalDataItems,
+                                   MultiModalDataParser)
+from vllm.multimodal.processing import (BaseMultiModalProcessor,
+                                        BaseProcessingInfo, PromptReplacement,
+                                        PromptUpdateDetails)
+from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
 
-from .interfaces import SupportsEagle3, SupportsLoRA, SupportsPP
+from .interfaces import (SupportsEagle3, SupportsLoRA, SupportsMultiModal,
+                         SupportsPP)
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
-from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
+from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
+                    maybe_prefix, merge_multimodal_embeddings)
 
 logger = init_logger(__name__)
 
+
+def _load_tensor_from_base64(data: str) -> torch.Tensor:
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ValueError("Failed to decode base64 embedding payload") from exc
+
+    buffer = io.BytesIO(raw)
+    tensor = torch.load(buffer, map_location="cpu", weights_only=True)
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError("Embedding payload must serialize a tensor")
+    if tensor.is_sparse:
+        tensor = tensor.to_dense()
+    return tensor
+
+
+class Qwen3VisionEmbeddingParser(MultiModalDataParser):
+
+    @staticmethod
+    def _ensure_2d(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        if tensor.ndim == 3 and tensor.shape[0] == 1:
+            tensor = tensor.squeeze(0)
+        if tensor.ndim != 2:
+            raise ValueError(
+                f"Expected embedding tensor with 2 dimensions, got {tensor.shape}"
+            )
+        return tensor.contiguous()
+
+    @staticmethod
+    def _to_tensor(payload: Union[str, dict[str, Any], list[Any], torch.Tensor]
+                   ) -> torch.Tensor:
+        if isinstance(payload, torch.Tensor):
+            tensor = payload
+        elif isinstance(payload, str):
+            tensor = _load_tensor_from_base64(payload)
+        elif isinstance(payload, dict):
+            if "data" not in payload:
+                raise ValueError(
+                    "Embedding dict payload must contain a 'data' field")
+            tensor = _load_tensor_from_base64(str(payload["data"]))
+        else:
+            tensor = torch.tensor(payload, dtype=torch.float32)
+
+        if tensor.device != torch.device("cpu"):
+            tensor = tensor.cpu()
+        if tensor.dtype not in (torch.float16, torch.float32, torch.bfloat16):
+            tensor = tensor.float()
+
+        return Qwen3VisionEmbeddingParser._ensure_2d(tensor.float())
+
+    def _parse_vision_embedding(
+        self, data: ModalityData[Any]
+    ) -> Optional[EmbeddingItems]:
+        if data is None:
+            return None
+        payloads: list[Any]
+        if isinstance(data, list):
+            payloads = data
+        else:
+            payloads = [data]
+
+        tensors = [self._to_tensor(payload) for payload in payloads]
+        return EmbeddingItems(tensors, "vision_embedding")
+
+    def _get_subparsers(self):
+        subparsers = super()._get_subparsers()
+        subparsers["vision_embedding"] = self._parse_vision_embedding
+        return subparsers
+
+
+class Qwen3VisionProcessingInfo(BaseProcessingInfo):
+
+    def get_hf_config(self) -> Qwen3Config:
+        return self.ctx.get_hf_config(Qwen3Config)
+
+    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+        return {"vision_embedding": 1}
+
+
+class Qwen3VisionDummyInputsBuilder(
+        BaseDummyInputsBuilder[Qwen3VisionProcessingInfo]):
+
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        count = mm_counts.get("vision_embedding", 0)
+        return "<|fim_pad|>" * count
+
+    def get_dummy_mm_data(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> MultiModalDataDict:
+        count = mm_counts.get("vision_embedding", 0)
+        if count == 0:
+            return {}
+
+        hidden_size = self.info.get_hf_config().hidden_size
+        dummy = torch.zeros((1, hidden_size), dtype=torch.float32)
+        return {"vision_embedding": [dummy.clone() for _ in range(count)]}
+
+
+class Qwen3VisionMultiModalProcessor(
+        BaseMultiModalProcessor[Qwen3VisionProcessingInfo]):
+
+    def _get_data_parser(self) -> MultiModalDataParser:
+        return Qwen3VisionEmbeddingParser()
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: Mapping[str, Any],
+    ) -> Sequence[PromptReplacement]:
+        tokenizer = self.info.get_tokenizer()
+        placeholder_token = "<|fim_pad|>"
+        placeholder_token_id = tokenizer.convert_tokens_to_ids(
+            placeholder_token)
+        if placeholder_token_id is None or placeholder_token_id < 0:
+            raise ValueError(
+                "Unable to determine token id for <|fim_pad|> placeholder"
+            )
+
+        def build_replacement(item_idx: int) -> PromptUpdateDetails[list[int]]:
+            embeds = mm_items["vision_embedding"].get(item_idx)
+            num_tokens = embeds.shape[0]
+            tokens = [placeholder_token_id] * num_tokens
+            return PromptUpdateDetails.from_seq(tokens)
+
+        return [
+            PromptReplacement(
+                modality="vision_embedding",
+                target=[placeholder_token_id],
+                replacement=lambda idx, fn=build_replacement: fn(idx),
+            )
+        ]
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: "BatchFeature",
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, Any]:
+        sizes = hf_inputs.get("vision_embedding_sizes")
+        if sizes is None:
+            return {}
+
+        if not isinstance(sizes, torch.Tensor):
+            sizes_tensor = torch.tensor(sizes, dtype=torch.long)
+        else:
+            sizes_tensor = sizes.to(dtype=torch.long, device="cpu")
+
+        if sizes_tensor.numel() == 0:
+            hf_inputs.pop("vision_embedding_sizes", None)
+            return {}
+
+        field_config = MultiModalFieldConfig.flat_from_sizes(
+            "vision_embedding",
+            sizes_tensor,
+        )
+        hf_inputs.pop("vision_embedding_sizes", None)
+        return {"vision_embedding_embeds": field_config}
+
+    def _apply_hf_processor_text_mm(
+        self,
+        prompt_text: str,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> tuple[list[int], BatchFeature, bool]:
+        if all(isinstance(items, EmbeddingItems) for items in mm_items.values()):
+            embedding_items = mm_items.get("vision_embedding")
+            if embedding_items is None:
+                return super()._apply_hf_processor_text_mm(
+                    prompt_text,
+                    mm_items,
+                    hf_processor_mm_kwargs,
+                    tokenization_kwargs,
+                )
+
+            tokenizer = self.info.get_tokenizer()
+            tokenized = tokenizer(prompt_text,
+                                  add_special_tokens=False)  # type: ignore[call-arg]
+            if isinstance(tokenized, Mapping):
+                prompt_ids = tokenized.get("input_ids", [])
+            else:
+                prompt_ids = tokenized
+
+            if prompt_ids and isinstance(prompt_ids[0], list):
+                prompt_ids = prompt_ids[0]
+
+            prompt_ids = list(map(int, prompt_ids)) if prompt_ids else []
+
+            num_items = embedding_items.get_count()
+            if num_items == 0:
+                hidden = self.info.get_hf_config().hidden_size
+                concat_embeds = torch.empty((0, hidden), dtype=torch.float32)
+                sizes = torch.tensor([], dtype=torch.long)
+            else:
+                tensors = [
+                    embedding_items.get(idx).detach().to(device="cpu")
+                    for idx in range(num_items)
+                ]
+                sizes = torch.tensor([tensor.shape[0] for tensor in tensors],
+                                      dtype=torch.long)
+                concat_embeds = torch.cat(tensors, dim=0)
+
+            processed_data = BatchFeature({
+                "input_ids": torch.tensor([prompt_ids], dtype=torch.long),
+                "vision_embedding_embeds": concat_embeds,
+                "vision_embedding_sizes": sizes,
+            })
+
+            return prompt_ids, processed_data, False
+
+        return super()._apply_hf_processor_text_mm(
+            prompt_text,
+            mm_items,
+            hf_processor_mm_kwargs,
+            tokenization_kwargs,
+        )
 
 class Qwen3Attention(nn.Module):
     def __init__(
@@ -255,7 +489,11 @@ class Qwen3Model(Qwen2Model):
         )
 
 
-class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
+@MULTIMODAL_REGISTRY.register_processor(Qwen3VisionMultiModalProcessor,
+                                        info=Qwen3VisionProcessingInfo,
+                                        dummy_inputs=Qwen3VisionDummyInputsBuilder)
+class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3,
+                       SupportsMultiModal):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -281,6 +519,11 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.model = Qwen3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self._vision_placeholder_token_id = getattr(
+            config, "vision_start_token_id", None)
+        tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
+        self._fallback_placeholder_token_id = tokenizer.convert_tokens_to_ids(
+            "<|fim_pad|>")
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -308,8 +551,94 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         num_layers = len(self.model.layers)
         return (2, num_layers // 2, num_layers - 3)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+        if modality == "vision_embedding":
+            return "<|fim_pad|>"
+        return None
+
+    def get_language_model(self) -> nn.Module:
+        return self.model
+
+    def _get_vision_placeholder_token_id(self) -> int:
+        if self._vision_placeholder_token_id is not None:
+            return self._vision_placeholder_token_id
+
+        if (self._fallback_placeholder_token_id is not None
+                and self._fallback_placeholder_token_id >= 0):
+            return self._fallback_placeholder_token_id
+
+        raise ValueError(
+            "Unable to determine placeholder token id for vision embeddings")
+
+    def _normalize_mm_embeddings(
+        self, vision_embedding_embeds: Union[torch.Tensor, Sequence[torch.Tensor]]
+    ) -> tuple[torch.Tensor, ...]:
+        def _flatten(value: Union[torch.Tensor, Sequence[torch.Tensor]]
+                    ) -> list[torch.Tensor]:
+            if isinstance(value, torch.Tensor):
+                if value.ndim == 2:
+                    return [value]
+                if value.ndim == 3:
+                    return [v for v in value]
+                raise ValueError(
+                    f"Expected 2D/3D tensor embeddings, got shape {value.shape}")
+            flattened: list[torch.Tensor] = []
+            for item in value:
+                flattened.extend(_flatten(item))
+            return flattened
+
+        tensors = _flatten(vision_embedding_embeds)
+        if not tensors:
+            raise ValueError("No vision embeddings provided")
+
+        return tuple(tensors)
+
+    def get_multimodal_embeddings(
+        self,
+        *,
+        vision_embedding_embeds: Union[torch.Tensor, Sequence[torch.Tensor]],
+        **_: object,
+    ) -> tuple[torch.Tensor, ...]:
+        tensors = self._normalize_mm_embeddings(vision_embedding_embeds)
+        dtype = self.model.embed_tokens.weight.dtype
+        device = self.model.embed_tokens.weight.device
+
+        processed: list[torch.Tensor] = []
+        for tensor in tensors:
+            tensor = tensor.to(device=device, dtype=dtype)
+            if tensor.ndim == 3 and tensor.shape[0] == 1:
+                tensor = tensor.squeeze(0)
+            if tensor.ndim != 2:
+                raise ValueError(
+                    f"Expected 2D tensor per vision embedding, got {tensor.shape}")
+            processed.append(tensor.contiguous())
+
+        return tuple(processed)
+
+    def get_input_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Optional[Sequence[torch.Tensor]] = None,
+        attn_metadata: Optional["AttentionMetadata"] = None,
+    ) -> torch.Tensor:
+        _ = attn_metadata  # unused; kept for v0 compatibility
+        inputs_embeds = self.model.get_input_embeddings(input_ids)
+        if multimodal_embeddings:
+            placeholder_id = self._get_vision_placeholder_token_id()
+            mm_embeddings = tuple(multimodal_embeddings)
+            logger.warning(
+                "Qwen3 vision embeddings merged: num_items=%d, shapes=%s",  # noqa: E501
+                len(mm_embeddings),
+                [tuple(t.shape) for t in mm_embeddings],
+            )
+            inputs_embeds = merge_multimodal_embeddings(
+                input_ids,
+                inputs_embeds,
+                mm_embeddings,
+                placeholder_id,
+            )
+        return inputs_embeds
 
     def forward(
         self,

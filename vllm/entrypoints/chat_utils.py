@@ -9,7 +9,7 @@ from collections import Counter, defaultdict, deque
 from collections.abc import Awaitable, Callable, Iterable
 from functools import cached_property, lru_cache, partial
 from pathlib import Path
-from typing import Any, Generic, Literal, TypeAlias, TypeVar, cast
+from typing import Any, Generic, Literal, TypeAlias, TypeVar, Union, cast
 
 import jinja2
 import jinja2.ext
@@ -61,6 +61,7 @@ MODALITY_PLACEHOLDERS_MAP = {
     "image": "<##IMAGE##>",
     "audio": "<##AUDIO##>",
     "video": "<##VIDEO##>",
+    "vision_embedding": "<##VISION_EMBED##>",
 }
 
 
@@ -181,6 +182,25 @@ class CustomChatCompletionContentSimpleVideoParam(TypedDict, total=False):
     """
 
 
+class ChatCompletionContentPartEmbeddingParam(TypedDict, total=False):
+    """Embedding payload for direct placeholder replacement.
+
+    Example JSON payload:
+
+    {
+        "type": "embedding",
+        "embedding": {
+            "data": "<base64 torch.save tensor>",
+            "encoding": "pt"
+        }
+    }
+    """
+
+    embedding: Required[Union[str, dict[str, Any], list[Any]]]
+
+    type: Required[Literal["embedding"]]
+
+
 class CustomThinkCompletionContentParam(TypedDict, total=False):
     """A Think Completion Content Param that accepts a plain text and a boolean.
 
@@ -213,6 +233,7 @@ ChatCompletionContentPartParam: TypeAlias = (
     | ChatCompletionContentPartImageEmbedsParam
     | CustomChatCompletionContentSimpleAudioParam
     | CustomChatCompletionContentSimpleVideoParam
+    | ChatCompletionContentPartEmbeddingParam
     | str
     | CustomThinkCompletionContentParam
 )
@@ -706,6 +727,9 @@ class MultiModalItemTracker(BaseMultiModalItemTracker[object]):
             mm_inputs["audio"] = items_by_modality["audio"]  # A list of audios
         if "video" in items_by_modality:
             mm_inputs["video"] = items_by_modality["video"]  # A list of videos
+        if "vision_embedding" in items_by_modality:
+            mm_inputs["vision_embedding"] = items_by_modality[
+                "vision_embedding"]
         return mm_inputs
 
     def create_parser(self) -> "BaseMultiModalContentParser":
@@ -741,6 +765,9 @@ class AsyncMultiModalItemTracker(BaseMultiModalItemTracker[Awaitable[object]]):
             mm_inputs["audio"] = items_by_modality["audio"]  # A list of audios
         if "video" in items_by_modality:
             mm_inputs["video"] = items_by_modality["video"]  # A list of videos
+        if "vision_embedding" in items_by_modality:
+            mm_inputs["vision_embedding"] = items_by_modality[
+                "vision_embedding"]
         return mm_inputs
 
     def create_parser(self) -> "BaseMultiModalContentParser":
@@ -797,6 +824,10 @@ class BaseMultiModalContentParser(ABC):
 
     @abstractmethod
     def parse_video(self, video_url: str | None, uuid: str | None = None) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def parse_embedding(self, embedding: Union[str, dict[str, Any], list[Any]]) -> None:
         raise NotImplementedError
 
 
@@ -885,6 +916,11 @@ class MultiModalContentParser(BaseMultiModalContentParser):
 
         placeholder = self._tracker.add("video", video, uuid)
         self._add_placeholder("video", placeholder)
+
+    def parse_embedding(
+        self, embedding: Union[str, dict[str, Any], list[Any]]) -> None:
+        placeholder = self._tracker.add("vision_embedding", embedding)
+        self._add_placeholder("vision_embedding", placeholder)
 
 
 class AsyncMultiModalContentParser(BaseMultiModalContentParser):
@@ -984,6 +1020,14 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
 
         placeholder = self._tracker.add("video", video, uuid)
         self._add_placeholder("video", placeholder)
+
+    def parse_embedding(
+        self, embedding: Union[str, dict[str, Any], list[Any]]) -> None:
+        future: asyncio.Future[Union[str, dict[str, Any], list[Any]]] = asyncio.Future()
+        future.set_result(embedding)
+
+        placeholder = self._tracker.add("vision_embedding", future)
+        self._add_placeholder("vision_embedding", placeholder)
 
 
 def validate_chat_template(chat_template: Path | str | None):
@@ -1125,6 +1169,7 @@ _TextParser = partial(cast, ChatCompletionContentPartTextParam)
 _ImageEmbedsParser = partial(cast, ChatCompletionContentPartImageEmbedsParam)
 _InputAudioParser = partial(cast, ChatCompletionContentPartInputAudioParam)
 _RefusalParser = partial(cast, ChatCompletionContentPartRefusalParam)
+_EmbeddingParser = partial(cast, ChatCompletionContentPartEmbeddingParam)
 _PILImageParser = partial(cast, CustomChatCompletionContentPILImageParam)
 _ThinkParser = partial(cast, CustomThinkCompletionContentParam)
 # Need to validate url objects
@@ -1151,6 +1196,7 @@ MM_PARSER_MAP: dict[
     "input_audio": lambda part: _InputAudioParser(part).get("input_audio", None),
     "refusal": lambda part: _RefusalParser(part).get("refusal", None),
     "video_url": lambda part: _VideoParser(part).get("video_url", {}).get("url", None),
+    "embedding": lambda part: _EmbeddingParser(part).get("embedding", None),
 }
 
 
@@ -1233,6 +1279,10 @@ def _parse_chat_message_content_mm_part(
                 # with url as a dict of {"url": url}
                 video_url = video_url.get("url", None)
             return "video_url", video_url
+        if "embedding" in part:
+            embedding_params = cast(ChatCompletionContentPartEmbeddingParam, part)
+            embedding = embedding_params.get("embedding", None)
+            return "embedding", embedding
         # Raise an error if no 'type' or direct URL is found.
         raise ValueError("Missing 'type' field in multimodal part.")
 
@@ -1351,6 +1401,10 @@ def _parse_chat_message_content_part(
         str_content = cast(str, content)
         mm_parser.parse_video(str_content, uuid)
         modality = "video"
+    elif part_type == "embedding":
+        embedding_content = cast(Union[str, dict[str, Any], list[Any]], content)
+        mm_parser.parse_embedding(embedding_content)
+        modality = "vision_embedding"
     else:
         raise NotImplementedError(f"Unknown part type: {part_type}")
 
