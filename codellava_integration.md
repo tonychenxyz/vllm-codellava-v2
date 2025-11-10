@@ -3,6 +3,10 @@
 This note documents the recent changes that allow `Qwen/Qwen3-*` checkpoints to accept pre-computed embeddings through the OpenAI-compatible API.
 
 ---
+## Installation
+```
+VLLM_USE_PRECOMPILED=1 uv pip install --editable ../vllm-codellava-v2
+```
 
 ## 1. Input Parsing & Chat API
 
