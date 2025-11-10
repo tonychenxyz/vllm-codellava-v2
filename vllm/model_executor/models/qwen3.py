@@ -35,6 +35,7 @@ from transformers import BatchFeature, Qwen3Config
 from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -60,7 +61,7 @@ from .interfaces import (SupportsEagle3, SupportsLoRA, SupportsMultiModal,
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
 from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
-                    maybe_prefix, merge_multimodal_embeddings)
+                    maybe_prefix)
 
 logger = init_logger(__name__)
 
@@ -156,6 +157,7 @@ class Qwen3VisionDummyInputsBuilder(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions] | None = None,
     ) -> MultiModalDataDict:
         count = mm_counts.get("vision_embedding", 0)
         if count == 0:
@@ -621,24 +623,26 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3,
         input_ids: torch.Tensor,
         multimodal_embeddings: Optional[Sequence[torch.Tensor]] = None,
         attn_metadata: Optional["AttentionMetadata"] = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         _ = attn_metadata  # unused; kept for v0 compatibility
-        inputs_embeds = self.model.get_input_embeddings(input_ids)
+        mm_embeddings: Optional[tuple[torch.Tensor, ...]] = None
         if multimodal_embeddings:
-            placeholder_id = self._get_vision_placeholder_token_id()
             mm_embeddings = tuple(multimodal_embeddings)
             logger.warning(
                 "Qwen3 vision embeddings merged: num_items=%d, shapes=%s",  # noqa: E501
                 len(mm_embeddings),
                 [tuple(t.shape) for t in mm_embeddings],
             )
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids,
-                inputs_embeds,
-                mm_embeddings,
-                placeholder_id,
-            )
-        return inputs_embeds
+
+        return super().get_input_embeddings(
+            input_ids,
+            multimodal_embeddings=mm_embeddings,
+            is_multimodal=is_multimodal,
+            handle_oov_mm_token=handle_oov_mm_token,
+        )
 
     def forward(
         self,

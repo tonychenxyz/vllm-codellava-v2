@@ -10,6 +10,7 @@ by any external pipeline – they simply need to be serialized with
 Before running this script, launch the vLLM server with Qwen3:
 
     vllm serve Qwen/Qwen3-4B-Thinking-2507 \
+      --enable-mm-embeds \
       --limit-mm-per-prompt '{"vision_embedding": 1}'
 
 Then execute:

@@ -76,8 +76,12 @@ if multimodal_embeddings:
 
    ```bash
    vllm serve Qwen/Qwen3-4B-Thinking-2507 \
+       --enable-mm-embeds \
        --limit-mm-per-prompt '{"vision_embedding": 1}'
    ```
+   `--enable-mm-embeds` must be set whenever you plan to stream pre-computed
+   embeddings into the model; otherwise the server rejects `vision_embedding`
+   inputs during request validation.
 
 2. **Prepare the embedding**
 

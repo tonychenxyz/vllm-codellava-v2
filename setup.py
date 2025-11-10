@@ -17,7 +17,10 @@ import torch
 from packaging.version import Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
-from setuptools_scm import get_version
+try:
+    from setuptools_scm import get_version as scm_get_version
+except ModuleNotFoundError:
+    scm_get_version = None
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
 
@@ -539,13 +542,25 @@ def get_gaudi_sw_version():
     return "0.0.0"  # when hl-smi is not available
 
 
+def _load_static_version() -> str:
+    version_file = os.path.join(ROOT_DIR, "vllm", "_version.py")
+    if not os.path.exists(version_file):
+        return "0.0.0"
+    module_name = "_vllm_static_version"
+    module = load_module_from_path(module_name, version_file)
+    return getattr(module, "__version__", "0.0.0")
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         return env_version
 
-    version = get_version(write_to="vllm/_version.py")
+    if scm_get_version is not None:
+        version = scm_get_version(write_to="vllm/_version.py")
+    else:
+        version = _load_static_version()
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
